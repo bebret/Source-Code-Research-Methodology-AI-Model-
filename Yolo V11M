@@ -1,0 +1,156 @@
+# ====================================================================
+# SCRIPT MASTER: YOLO11-MEDIUM (KLASIFIKASI PENYAKIT KULIT)
+# ====================================================================
+!pip install -q roboflow ultralytics scikit-learn matplotlib pandas tqdm
+
+from google.colab import drive
+import os
+import torch
+from ultralytics import YOLO
+from sklearn.metrics import classification_report
+import matplotlib.pyplot as plt
+import pandas as pd
+from tqdm import tqdm
+
+# ====================================================================
+# 1. PASANG SABUK PENGAMAN (GOOGLE DRIVE)
+# ====================================================================
+drive.mount('/content/drive')
+
+# Bikin folder khusus YOLO11 biar nggak nyampur
+drive_path = "/content/drive/MyDrive/Skripsi_YOLO11m"
+os.makedirs(drive_path, exist_ok=True)
+
+# ====================================================================
+# 2. DOWNLOAD DATASET ROBOFLOW
+# ====================================================================
+print("\n⏳ Mengunduh Dataset dari Roboflow...")
+from roboflow import Roboflow
+rf = Roboflow(api_key="CU04tyVnI9U4FqyF9aPv")
+project = rf.workspace("alberts-workspace-lrb7z").project("skin-disease-3-jjow2")
+version = project.version(3)
+dataset = version.download("folder")
+
+# ====================================================================
+# 3. TRAINING YOLO11-MEDIUM DENGAN AUTO-RESUME
+# ====================================================================
+last_weight_path = f"{drive_path}/train/weights/last.pt"
+best_weight_path = f"{drive_path}/train/weights/best.pt"
+
+# Logika Auto-Resume Bawaan Ultralytics
+if os.path.exists(last_weight_path):
+    print("\n🔄 DITEMUKAN FILE LAST.PT DI DRIVE!")
+    print("🚀 Melanjutkan training yang sempat terputus (Auto-Resume)...")
+    model = YOLO(last_weight_path)
+    model.train(resume=True)
+else:
+    print("\n🚀 MEMULAI TRAINING BARU YOLO11-MEDIUM (EPOCH 1)...")
+    # Panggil arsitektur YOLO11 Medium khusus Klasifikasi (-cls)
+    model = YOLO('yolo11m-cls.pt')
+
+    model.train(
+        data=dataset.location,
+        project=drive_path,    # Simpan langsung ke Drive
+        epochs=35,             # Titik manis sebelum overfitting
+        imgsz=640,             # Resolusi 416 agar lebih ngebut dari 640
+        batch=8,              # VRAM T4 sanggup narik batch 16 untuk ukuran M
+
+        # Diet Augmentasi (Sesuai kesepakatan awal)
+        fliplr=0.5,
+        degrees=10.0,
+        mosaic=0.0,
+        mixup=0.0,
+        workers=2,
+        cache=True
+    )
+
+# ====================================================================
+# 4. EVALUASI AKHIR (DIJAMIN ANTI-FREEZE & ANTI-INFINITE LOOP)
+# ====================================================================
+print("\n" + "="*50)
+print("⏳ MEMULAI UJI KLINIS MODEL UNTUK RAPOR SKRIPSI...")
+print("="*50)
+
+# Panggil model juara dari Drive
+model_eval = YOLO(best_weight_path)
+
+# Pelacak Folder Validasi Otomatis
+base_dir = dataset.location
+if os.path.exists(os.path.join(base_dir, "valid")): val_dir = os.path.join(base_dir, "valid")
+elif os.path.exists(os.path.join(base_dir, "val")): val_dir = os.path.join(base_dir, "val")
+elif os.path.exists(os.path.join(base_dir, "test")): val_dir = os.path.join(base_dir, "test")
+
+kelas_penyakit = sorted(os.listdir(val_dir))
+y_true = []
+y_pred = []
+
+# Bersihkan memori GPU sebelum ujian
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+for nama_kelas in kelas_penyakit:
+    folder_kelas = os.path.join(val_dir, nama_kelas)
+    if not os.path.isdir(folder_kelas): continue
+
+    daftar_gambar = os.listdir(folder_kelas)
+    total_gambar = len(daftar_gambar)
+    print(f"\n👉 Mulai mengecek kelas: {nama_kelas} ({total_gambar} gambar)")
+
+    # MANTRA ANTI-FREEZE
+    with torch.no_grad():
+        for i, file_gambar in enumerate(daftar_gambar):
+            path_gambar = os.path.join(folder_kelas, file_gambar)
+
+            # Tebak gambar (Mode senyap)
+            hasil = model_eval(path_gambar, verbose=False)
+
+            # CARA BARU ANTI-INFINITE LOOP (Langsung tembak index 0)
+            prediksi = hasil
+
+            if hasattr(prediksi, 'probs') and prediksi.probs is not None:
+                tebakan_idx = prediksi.probs.top1
+                nama_tebakan = prediksi.names[tebakan_idx]
+                y_true.append(nama_kelas)
+                y_pred.append(nama_tebakan)
+
+            if (i + 1) % 50 == 0 or (i + 1) == total_gambar:
+                print(f"   ✓ Selesai memproses {i + 1}/{total_gambar} gambar...")
+
+# ====================================================================
+# 5. CETAK RAPOR & SIMPAN GRAFIK KE DRIVE
+# ====================================================================
+print("\n" + "="*50)
+print("🏆 HASIL EVALUASI AKHIR MODEL (YOLO11-MEDIUM) 🏆")
+laporan_text = classification_report(y_true, y_pred, target_names=kelas_penyakit, digits=2)
+print(laporan_text)
+
+# Tarik data F1-Score
+report_dict = classification_report(y_true, y_pred, target_names=kelas_penyakit, output_dict=True)
+f1_scores = {kelas: report_dict[kelas]['f1-score'] for kelas in kelas_penyakit}
+
+# Gambar Bar Chart
+df_plot = pd.DataFrame(list(f1_scores.items()), columns=['Kelas', 'F1-Score']).sort_values('F1-Score', ascending=True)
+
+fig, ax = plt.subplots(figsize=(10, 8))
+# Pakai warna Ungu biar beda sama grafik model yang lain
+bars = ax.barh(df_plot['Kelas'], df_plot['F1-Score'] * 100, color='#8e44ad')
+
+ax.set_xlabel('Tingkat Akurasi (F1-Score) dalam Persen %')
+ax.set_title(f'Grafik Akurasi YOLO11m per Kelas (Total: {round(report_dict["accuracy"]*100, 1)}%)')
+ax.set_xlim(0, 105)
+
+for bar in bars:
+    width = bar.get_width()
+    label_y = bar.get_y() + bar.get_height() / 2
+    ax.text(width + 1, label_y, s=f'{width:.1f}%', va='center', fontweight='bold', color='#333')
+
+plt.tight_layout()
+
+# Simpan Permanen ke Drive
+grafik_path = f"{drive_path}/Grafik_Akurasi_YOLO11m.png"
+plt.savefig(grafik_path)
+
+print(f"\n✅ Grafik berhasil dibuat dan DISIMPAN PERMANEN di Google Drive:")
+print(f"👉 Lokasi: {grafik_path}")
+
+plt.show()
