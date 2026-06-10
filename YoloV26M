@@ -1,0 +1,169 @@
+!pip install -q roboflow ultralytics scikit-learn matplotlib pandas
+
+# ================== ANTI OOM SETTING ==================
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+import gc
+import torch
+import pandas as pd
+import matplotlib.pyplot as plt
+from ultralytics import YOLO
+from sklearn.metrics import classification_report
+from roboflow import Roboflow
+from google.colab import drive
+
+# 1. Mount Drive
+drive.mount('/content/drive')
+best_weight_path = "/content/drive/MyDrive/Skripsi_YOLO26m_640/train/weights/best.pt"
+
+# 2. Load Model
+print(f"\n🧠 Load model: {best_weight_path}")
+model_eval = YOLO(best_weight_path)
+
+device = 0 if torch.cuda.is_available() else "cpu"
+if device == 0:
+    model_eval.to("cuda")
+    model_eval.model.half()  # 🔥 hemat VRAM
+
+print("Task model:", model_eval.task)
+
+# 3. Load Dataset
+rf = Roboflow(api_key="CU04tyVnI9U4FqyF9aPv")
+project = rf.workspace("alberts-workspace-lrb7z").project("skin-disease-3-jjow2")
+version = project.version(3)
+dataset = version.download("folder")
+
+base_dir = dataset.location
+val_dir = next((os.path.join(base_dir, d) for d in ["valid", "val", "test"]
+                if os.path.exists(os.path.join(base_dir, d))), None)
+
+kelas_penyakit = sorted([
+    d for d in os.listdir(val_dir)
+    if os.path.isdir(os.path.join(val_dir, d))
+])
+
+y_true_all = []
+y_pred_all = []
+
+print("\n" + "="*50)
+print("⏳ MULAI EVALUASI")
+print("="*50)
+
+# 4. Evaluasi
+for nama_kelas in kelas_penyakit:
+    folder_kelas = os.path.join(val_dir, nama_kelas)
+    daftar_gambar = [f for f in os.listdir(folder_kelas)
+                     if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+
+    if len(daftar_gambar) == 0:
+        continue
+
+    print(f"👉 {nama_kelas} ({len(daftar_gambar)} gambar)")
+
+    semua_path = [os.path.join(folder_kelas, f) for f in daftar_gambar]
+
+    try:
+        hasil_batch = model_eval(
+            source=semua_path,
+            imgsz=640,     # 🔥 lebih ringan
+            batch=2,       # 🔥 anti OOM
+            stream=True,
+            verbose=False,
+            device=device,
+            half=True
+        )
+
+        for hasil in hasil_batch:
+            try:
+                # CLASSIFICATION MODEL
+                if hasil.probs is not None:
+                    idx = int(hasil.probs.top1)
+                    nama_tebakan = hasil.names[idx]
+
+                    y_true_all.append(nama_kelas)
+                    y_pred_all.append(nama_tebakan)
+
+            except Exception:
+                continue
+
+    except RuntimeError as e:
+        print("⚠️ OOM! fallback ke mode super ringan...")
+
+        hasil_batch = model_eval(
+            source=semua_path,
+            imgsz=320,
+            batch=1,
+            stream=True,
+            verbose=False,
+            device=device,
+            half=True
+        )
+
+        for hasil in hasil_batch:
+            if hasil.probs is not None:
+                idx = int(hasil.probs.top1)
+                nama_tebakan = hasil.names[idx]
+
+                y_true_all.append(nama_kelas)
+                y_pred_all.append(nama_tebakan)
+
+    # bersihin memori tiap kelas
+    del semua_path
+    del daftar_gambar
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
+    print("   ✓ selesai")
+
+# 5. HASIL
+print("\n" + "="*50)
+print("🏆 HASIL AKHIR 🏆")
+
+if len(y_true_all) == 0:
+    print("❌ GAGAL: tidak ada prediksi!")
+else:
+    laporan = classification_report(
+        y_true_all,
+        y_pred_all,
+        labels=kelas_penyakit,
+        target_names=kelas_penyakit,
+        digits=2,
+        zero_division=0
+    )
+    print(laporan)
+
+    report_dict = classification_report(
+        y_true_all,
+        y_pred_all,
+        labels=kelas_penyakit,
+        target_names=kelas_penyakit,
+        output_dict=True,
+        zero_division=0
+    )
+
+    df_plot = pd.DataFrame([
+        {"Kelas": k, "F1": v["f1-score"]*100}
+        for k, v in report_dict.items() if k in kelas_penyakit
+    ]).sort_values("F1")
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    bars = ax.barh(df_plot["Kelas"], df_plot["F1"])
+
+    ax.set_xlabel("F1 Score (%)")
+    ax.set_title(f"Akurasi per Kelas (Total: {round(report_dict['accuracy']*100, 1)}%)")
+    ax.set_xlim(0, 100)
+
+    for bar in bars:
+        w = bar.get_width()
+        ax.text(w + 1, bar.get_y() + bar.get_height()/2, f"{w:.1f}%", va='center')
+
+    plt.tight_layout()
+
+    save_path = "/content/drive/MyDrive/Skripsi_YOLO26m_640/Grafik_Akurasi_FINAL.png"
+    plt.savefig(save_path)
+
+    print(f"\n✅ Grafik disimpan di: {save_path}")
+    plt.show()
